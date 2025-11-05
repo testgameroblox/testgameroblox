@@ -1,667 +1,627 @@
 -- test
---[[ 
-  Fisch Admin Menu (LocalScript for exploit executors)
-  Features:
-    - Draggable GUI
-    - Player list with actions (TeleportTo, Bring, Copy Name)
-    - WalkSpeed / JumpPower sliders
-    - Noclip toggle
-    - Fly toggle (simple)
-    - Infinite Jump toggle
-    - Respawn button
-    - Auto-join: tìm server có player (basic)
-    - Quick invoke FireServer / InvokeServer area (manual remote name entry)
-  Notes:
-    - Some features require exploit functions (sethiddenproperty, syn.request, http_request, etc.)
-    - Use responsibly.
---]]
+-- Admin Menu (Fisch-style) - LocalScript
+-- UI matches the screenshot layout: Title, avatar+welcome, center grid of actions, right player list with tags.
+-- Fill SERVER_REMOTES with your game's remote names if you want server-side actions to function.
 
--- ===== CONFIG =====
-local UI_THEME = {
-    background = Color3.fromRGB(25,25,25),
-    accent = Color3.fromRGB(0, 170, 255),
-    text = Color3.fromRGB(230,230,230)
+-- ======= CONFIG =======
+local UI = {
+    TitleText = "Admin",
+    WelcomePrefix = "Welcome,",
+    OwnerName = "CarbonMeister", -- show sample (you can programmatically set to LocalPlayer.Name)
+    Width = 840,
+    Height = 420,
+    Theme = {
+        Background = Color3.fromRGB(12,12,12),
+        Panel = Color3.fromRGB(18,18,18),
+        Accent = Color3.fromRGB(200,60,60),
+        Accent2 = Color3.fromRGB(0,170,200),
+        Text = Color3.fromRGB(230,230,230)
+    }
 }
-local TARGET_PLACE_ID = game.PlaceId -- change if you want to use for TeleportToPlaceInstance
-local AUTOJOIN_POLL = 3 -- seconds between requests
 
--- ===== SERVICES =====
+-- Put server remote paths here if available (example: {"ReplicatedStorage.AdminRemotes.Ban", ...})
+local SERVER_REMOTES = {
+    Ban = "ReplicatedStorage.AdminRemotes.Ban",        -- expects :FireServer(userId or name)
+    Unban = "ReplicatedStorage.AdminRemotes.Unban",
+    Kick = "ReplicatedStorage.AdminRemotes.Kick",
+    Give = "ReplicatedStorage.AdminRemotes.Give",
+    Announce = "ReplicatedStorage.AdminRemotes.Announce"
+}
+
+-- ======= SERVICES =======
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
+local LocalPlayer = Players.LocalPlayer
+local HttpService = game:GetService("HttpService")
 local StarterGui = game:GetService("StarterGui")
 local TeleportService = game:GetService("TeleportService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local LocalPlayer = Players.LocalPlayer
 
--- ===== UTIL / Executor detection =====
-local function try_call_http(req)
-    -- req: { Url=..., Method="GET", Body=..., Headers=... }
-    -- return {StatusCode=200, Body="..."} or nil
-    if syn and syn.request then
-        return syn.request(req)
-    elseif request then
-        return request(req)
-    elseif http and http.request then
-        return http.request(req)
-    elseif (http_request) then
-        return http_request(req)
-    else
-        -- fallback using HttpService (may be blocked)
-        local HttpService = game:GetService("HttpService")
-        local method = (req.Method or "GET"):upper()
-        local ok, res = pcall(function()
-            if method == "GET" then
-                return { StatusCode = 200, Body = HttpService:GetAsync(req.Url, true) }
-            else
-                local body = req.Body or ""
-                return { StatusCode = 200, Body = HttpService:PostAsync(req.Url, body, Enum.HttpContentType.ApplicationJson) }
-            end
-        end)
-        return ok and res or nil
+-- ======= UTIL =======
+local function findObjectByPath(path)
+    if not path or path == "" then return nil end
+    local parts = {}
+    for part in string.gmatch(path, "([^%.]+)") do table.insert(parts, part) end
+    local obj = game
+    for _, p in ipairs(parts) do
+        obj = obj:FindFirstChild(p)
+        if not obj then return nil end
     end
+    return obj
 end
 
--- helper: create UI
-local function createGUI()
-    local screenGui = Instance.new("ScreenGui")
-    screenGui.Name = "FischAdminMenu"
-    screenGui.ResetOnSpawn = false
-    screenGui.IgnoreGuiInset = true
-    screenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
-
-    -- main frame
-    local main = Instance.new("Frame")
-    main.Name = "Main"
-    main.Size = UDim2.new(0, 420, 0, 480)
-    main.Position = UDim2.new(0.02, 0, 0.08, 0)
-    main.BackgroundColor3 = UI_THEME.background
-    main.BorderSizePixel = 0
-    main.Parent = screenGui
-
-    -- title bar (for dragging)
-    local title = Instance.new("Frame")
-    title.Name = "Title"
-    title.Size = UDim2.new(1, 0, 0, 30)
-    title.BackgroundTransparency = 1
-    title.Parent = main
-
-    local titleLabel = Instance.new("TextLabel")
-    titleLabel.Name = "Label"
-    titleLabel.Size = UDim2.new(0.6, 0, 1, 0)
-    titleLabel.Position = UDim2.new(0.02, 0, 0, 0)
-    titleLabel.BackgroundTransparency = 1
-    titleLabel.Text = "Fisch Admin Menu"
-    titleLabel.TextColor3 = UI_THEME.text
-    titleLabel.Font = Enum.Font.SourceSansSemibold
-    titleLabel.TextSize = 18
-    titleLabel.TextXAlignment = Enum.TextXAlignment.Left
-    titleLabel.Parent = title
-
-    local closeBtn = Instance.new("TextButton")
-    closeBtn.Name = "Close"
-    closeBtn.Size = UDim2.new(0, 28, 0, 20)
-    closeBtn.Position = UDim2.new(0.94, 0, 0.08, 0)
-    closeBtn.BackgroundColor3 = UI_THEME.accent
-    closeBtn.Text = "X"
-    closeBtn.Font = Enum.Font.SourceSansBold
-    closeBtn.TextSize = 16
-    closeBtn.TextColor3 = Color3.new(1,1,1)
-    closeBtn.Parent = title
-
-    -- left: player list
-    local left = Instance.new("Frame")
-    left.Name = "Left"
-    left.Size = UDim2.new(0, 200, 1, -40)
-    left.Position = UDim2.new(0, 10, 0, 40)
-    left.BackgroundTransparency = 1
-    left.Parent = main
-
-    local leftLabel = Instance.new("TextLabel")
-    leftLabel.Size = UDim2.new(1, 0, 0, 20)
-    leftLabel.BackgroundTransparency = 1
-    leftLabel.Text = "Players"
-    leftLabel.TextColor3 = UI_THEME.text
-    leftLabel.Font = Enum.Font.SourceSansSemibold
-    leftLabel.TextSize = 16
-    leftLabel.Parent = left
-
-    local playerList = Instance.new("ScrollingFrame")
-    playerList.Name = "PlayerList"
-    playerList.Size = UDim2.new(1, 0, 1, -30)
-    playerList.Position = UDim2.new(0, 0, 0, 26)
-    playerList.CanvasSize = UDim2.new(0,0)
-    playerList.ScrollBarThickness = 6
-    playerList.BackgroundTransparency = 1
-    playerList.Parent = left
-
-    local uiLayout = Instance.new("UIListLayout")
-    uiLayout.SortOrder = Enum.SortOrder.LayoutOrder
-    uiLayout.Padding = UDim.new(0,6)
-    uiLayout.Parent = playerList
-
-    -- right: controls
-    local right = Instance.new("Frame")
-    right.Name = "Right"
-    right.Size = UDim2.new(0, 200, 1, -40)
-    right.Position = UDim2.new(0, 210, 0, 40)
-    right.BackgroundTransparency = 1
-    right.Parent = main
-
-    local controls = Instance.new("Frame")
-    controls.Size = UDim2.new(1, 0, 1, 0)
-    controls.BackgroundTransparency = 1
-    controls.Parent = right
-
-    local function makeButton(text, posY)
-        local b = Instance.new("TextButton")
-        b.Size = UDim2.new(1, 0, 0, 32)
-        b.Position = UDim2.new(0, 0, 0, posY)
-        b.BackgroundColor3 = UI_THEME.accent
-        b.Text = text
-        b.Font = Enum.Font.SourceSans
-        b.TextSize = 14
-        b.TextColor3 = Color3.new(1,1,1)
-        b.Parent = controls
-        return b
+local function safeFire(remotePath, ...)
+    local r = findObjectByPath(remotePath)
+    if r and r.FireServer then
+        local ok, err = pcall(function() r:FireServer(...) end)
+        if not ok then warn("FireServer failed:", err) end
+        return ok
     end
-
-    -- basic buttons
-    local teleportBtn = makeButton("Teleport To Selected", 0)
-    local bringBtn = makeButton("Bring Selected", 40)
-    local copyBtn = makeButton("Copy Name", 80)
-    local respawnBtn = makeButton("Respawn", 120)
-
-    -- sliders for speed/jump
-    local speedLabel = Instance.new("TextLabel")
-    speedLabel.Position = UDim2.new(0, 0, 0, 170)
-    speedLabel.Size = UDim2.new(1, 0, 0, 18)
-    speedLabel.BackgroundTransparency = 1
-    speedLabel.Text = "WalkSpeed: 16"
-    speedLabel.TextColor3 = UI_THEME.text
-    speedLabel.Font = Enum.Font.SourceSans
-    speedLabel.TextSize = 14
-    speedLabel.Parent = controls
-
-    local speedBox = Instance.new("TextBox")
-    speedBox.Position = UDim2.new(0,0,0,190)
-    speedBox.Size = UDim2.new(1,0,0,28)
-    speedBox.Text = "16"
-    speedBox.Font = Enum.Font.SourceSans
-    speedBox.TextSize = 14
-    speedBox.ClearTextOnFocus = false
-    speedBox.Parent = controls
-
-    local jumpLabel = Instance.new("TextLabel")
-    jumpLabel.Position = UDim2.new(0,0,0,230)
-    jumpLabel.Size = UDim2.new(1,0,0,18)
-    jumpLabel.BackgroundTransparency = 1
-    jumpLabel.Text = "JumpPower: 50"
-    jumpLabel.TextColor3 = UI_THEME.text
-    jumpLabel.Font = Enum.Font.SourceSans
-    jumpLabel.TextSize = 14
-    jumpLabel.Parent = controls
-
-    local jumpBox = Instance.new("TextBox")
-    jumpBox.Position = UDim2.new(0,0,0,250)
-    jumpBox.Size = UDim2.new(1,0,0,28)
-    jumpBox.Text = "50"
-    jumpBox.Font = Enum.Font.SourceSans
-    jumpBox.TextSize = 14
-    jumpBox.ClearTextOnFocus = false
-    jumpBox.Parent = controls
-
-    -- toggles
-    local noclipBtn = makeButton("Toggle Noclip (Off)", 300)
-    local flyBtn = makeButton("Toggle Fly (Off)", 340)
-    local infJumpBtn = makeButton("Toggle Infinite Jump (Off)", 380)
-
-    -- bottom: invoke remote area
-    local remoteLabel = Instance.new("TextLabel")
-    remoteLabel.Position = UDim2.new(0,0,0,420)
-    remoteLabel.Size = UDim2.new(1,0,0,16)
-    remoteLabel.BackgroundTransparency = 1
-    remoteLabel.Text = "FireServer/InvokeServer (Manual remote name)"
-    remoteLabel.TextColor3 = UI_THEME.text
-    remoteLabel.Font = Enum.Font.SourceSans
-    remoteLabel.TextSize = 12
-    remoteLabel.Parent = main
-
-    local remoteBox = Instance.new("TextBox")
-    remoteBox.Position = UDim2.new(0,0,0,436)
-    remoteBox.Size = UDim2.new(0.6,0,0,28)
-    remoteBox.Text = "Folder.RemoteName"
-    remoteBox.Font = Enum.Font.SourceSans
-    remoteBox.TextSize = 14
-    remoteBox.ClearTextOnFocus = false
-    remoteBox.Parent = main
-
-    local fireBtn = Instance.new("TextButton")
-    fireBtn.Position = UDim2.new(0.62, 0, 0, 436)
-    fireBtn.Size = UDim2.new(0.18,0,0,28)
-    fireBtn.Text = "FireServer"
-    fireBtn.Font = Enum.Font.SourceSans
-    fireBtn.TextSize = 14
-    fireBtn.Parent = main
-
-    local invokeBtn = Instance.new("TextButton")
-    invokeBtn.Position = UDim2.new(0.82, 0, 0, 436)
-    invokeBtn.Size = UDim2.new(0.16,0,0,28)
-    invokeBtn.Text = "InvokeServer"
-    invokeBtn.Font = Enum.Font.SourceSans
-    invokeBtn.TextSize = 14
-    invokeBtn.Parent = main
-
-    -- make draggable
-    local dragging, dragInput, dragStart, startPos = false, nil, nil, nil
-    local function update(input)
-        local delta = input.Position - dragStart
-        main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+    return false
+end
+local function safeInvoke(remotePath, ...)
+    local r = findObjectByPath(remotePath)
+    if r and r.InvokeServer then
+        local ok, res = pcall(function() return r:InvokeServer(...) end)
+        if ok then return true, res end
+        return false, res
     end
-    title.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 then
-            dragging = true
-            dragStart = input.Position
-            startPos = main.Position
-            input.Changed:Connect(function()
-                if input.UserInputState == Enum.UserInputState.End then
-                    dragging = false
-                end
-            end)
-        end
-    end)
-    title.InputChanged:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseMovement then
-            dragInput = input
-        end
-    end)
-    UserInputService.InputChanged:Connect(function(input)
-        if input == dragInput and dragging then
-            update(input)
-        end
-    end)
-
-    -- close button
-    closeBtn.MouseButton1Click:Connect(function()
-        screenGui:Destroy()
-    end)
-
-    -- return UI refs
-    return {
-        ScreenGui = screenGui,
-        PlayerList = playerList,
-        TeleportBtn = teleportBtn,
-        BringBtn = bringBtn,
-        CopyBtn = copyBtn,
-        RespawnBtn = respawnBtn,
-        SpeedBox = speedBox,
-        JumpBox = jumpBox,
-        SpeedLabel = speedLabel,
-        JumpLabel = jumpLabel,
-        NoclipBtn = noclipBtn,
-        FlyBtn = flyBtn,
-        InfJumpBtn = infJumpBtn,
-        RemoteBox = remoteBox,
-        FireBtn = fireBtn,
-        InvokeBtn = invokeBtn
-    }
+    return false, "no-invoke"
 end
 
--- ===== UI create =====
-local ui = createGUI()
+-- ======= CREATE UI =======
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "FischAdminMenu"
+screenGui.ResetOnSpawn = false
+screenGui.IgnoreGuiInset = true
+screenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
 
--- ===== Player list population =====
+local root = Instance.new("Frame")
+root.Name = "Root"
+root.Size = UDim2.new(0, UI.Width, 0, UI.Height)
+root.Position = UDim2.new(0.04, 0, 0.08, 0)
+root.BackgroundColor3 = UI.Theme.Background
+root.BorderSizePixel = 0
+root.Parent = screenGui
+root.Active = true
+root.Draggable = false -- we'll implement nicer dragging
+
+-- Title bar top-left (white "Admin" like image)
+local title = Instance.new("TextLabel")
+title.Name = "Title"
+title.Position = UDim2.new(0, 12, 0, 8)
+title.Size = UDim2.new(0, 160, 0, 38)
+title.BackgroundTransparency = 1
+title.Text = UI.TitleText
+title.Font = Enum.Font.SourceSansSemibold
+title.TextSize = 30
+title.TextColor3 = Color3.new(1,1,1)
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = root
+
+-- Left panel: avatar + welcome + small stats
+local leftPanel = Instance.new("Frame")
+leftPanel.Name = "Left"
+leftPanel.Size = UDim2.new(0, 240, 1, -20)
+leftPanel.Position = UDim2.new(0, 12, 0, 58)
+leftPanel.BackgroundColor3 = UI.Theme.Panel
+leftPanel.BorderSizePixel = 0
+leftPanel.Parent = root
+
+-- Avatar (placeholder image label)
+local avatar = Instance.new("ImageLabel")
+avatar.Name = "Avatar"
+avatar.Position = UDim2.new(0, 12, 0, 12)
+avatar.Size = UDim2.new(0, 78, 0, 78)
+avatar.BackgroundTransparency = 1
+avatar.Image = "rbxthumb://type=AvatarHeadShot&id=" .. LocalPlayer.UserId .. "&w=48&h=48"
+avatar.Parent = leftPanel
+
+local welcome = Instance.new("TextLabel")
+welcome.Name = "Welcome"
+welcome.Position = UDim2.new(0, 100, 0, 18)
+welcome.Size = UDim2.new(0, 120, 0, 24)
+welcome.BackgroundTransparency = 1
+welcome.Font = Enum.Font.GothamSemibold
+welcome.TextSize = 20
+welcome.TextColor3 = UI.Theme.Text
+welcome.Text = UI.WelcomePrefix
+welcome.TextXAlignment = Enum.TextXAlignment.Left
+welcome.Parent = leftPanel
+
+local owner = Instance.new("TextLabel")
+owner.Name = "Owner"
+owner.Position = UDim2.new(0, 100, 0, 44)
+owner.Size = UDim2.new(0, 130, 0, 30)
+owner.BackgroundTransparency = 1
+owner.Font = Enum.Font.GothamBold
+owner.TextSize = 22
+owner.TextColor3 = UI.Theme.Text
+owner.Text = LocalPlayer.Name -- show local player's name by default
+owner.TextXAlignment = Enum.TextXAlignment.Left
+owner.Parent = leftPanel
+
+local smallInfo = Instance.new("TextLabel")
+smallInfo.Name = "SmallInfo"
+smallInfo.Position = UDim2.new(0, 12, 0, 100)
+smallInfo.Size = UDim2.new(1, -24, 0, 40)
+smallInfo.BackgroundTransparency = 1
+smallInfo.Font = Enum.Font.SourceSans
+smallInfo.TextSize = 14
+smallInfo.TextColor3 = UI.Theme.Text
+smallInfo.Text = "Status: Admin Panel\nMode: Fisch"
+smallInfo.TextXAlignment = Enum.TextXAlignment.Left
+smallInfo.TextYAlignment = Enum.TextYAlignment.Top
+smallInfo.Parent = leftPanel
+
+-- Center panel: grid of actions (3 columns)
+local centerPanel = Instance.new("Frame")
+centerPanel.Name = "Center"
+centerPanel.Size = UDim2.new(0, 360, 1, -20)
+centerPanel.Position = UDim2.new(0, 262, 0, 58)
+centerPanel.BackgroundTransparency = 1
+centerPanel.Parent = root
+
+local gridHolder = Instance.new("Frame")
+gridHolder.Name = "Grid"
+gridHolder.Size = UDim2.new(1, 0, 1, 0)
+gridHolder.BackgroundColor3 = UI.Theme.Panel
+gridHolder.BorderSizePixel = 0
+gridHolder.Parent = centerPanel
+
+local gridLayout = Instance.new("UIGridLayout")
+gridLayout.CellSize = UDim2.new(0, 110, 0, 64)
+gridLayout.CellPadding = UDim2.new(0, 12, 0, 12)
+gridLayout.FillDirection = Enum.FillDirection.Horizontal
+gridLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+gridLayout.VerticalAlignment = Enum.VerticalAlignment.Top
+gridLayout.Parent = gridHolder
+
+local function makeActionButton(text, color)
+    local btn = Instance.new("TextButton")
+    btn.Name = text:gsub("%s","")
+    btn.Size = UDim2.new(0, 110, 0, 64)
+    btn.BackgroundColor3 = color or UI.Theme.Accent2
+    btn.Text = text
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 16
+    btn.TextColor3 = Color3.new(1,1,1)
+    btn.Parent = gridHolder
+    return btn
+end
+
+-- Create action buttons that match screenshot words
+local btnBan = makeActionButton("Ban", Color3.fromRGB(200,40,40))
+local btnUnban = makeActionButton("Unban", Color3.fromRGB(0,200,120))
+local btnKick = makeActionButton("Kick", Color3.fromRGB(200,120,40))
+
+local btnTo = makeActionButton("To")
+local btnBring = makeActionButton("Bring")
+local btnTPLoc = makeActionButton("TP Location")
+
+local btnSetValue = makeActionButton("Set Value")
+local btnGive = makeActionButton("Give")
+local btnClearInv = makeActionButton("Clear Inventory")
+
+local btnHardWipe = makeActionButton("Hard Wipe")
+local btnUnFreeze = makeActionButton("[Un]Freeze")
+local btnToggleFly = makeActionButton("Toggle Fly")
+
+-- Bottom controls in center: Announce / Notify / Announce All Servers
+local bottomHolder = Instance.new("Frame")
+bottomHolder.Size = UDim2.new(1, -24, 0, 48)
+bottomHolder.Position = UDim2.new(0, 12, 1, -64)
+bottomHolder.BackgroundTransparency = 1
+bottomHolder.Parent = gridHolder
+
+local announceBox = Instance.new("TextBox")
+announceBox.PlaceholderText = "Enter announcement content..."
+announceBox.Size = UDim2.new(1, -260, 0, 32)
+announceBox.Position = UDim2.new(0, 0, 0, 0)
+announceBox.Parent = bottomHolder
+announceBox.ClearTextOnFocus = false
+announceBox.Font = Enum.Font.SourceSans
+announceBox.TextSize = 14
+
+local announceBtn = Instance.new("TextButton")
+announceBtn.Size = UDim2.new(0, 120, 0, 32)
+announceBtn.Position = UDim2.new(1, -248, 0, 0)
+announceBtn.Text = "Announce"
+announceBtn.Font = Enum.Font.GothamBold
+announceBtn.TextSize = 14
+announceBtn.BackgroundColor3 = UI.Theme.Accent2
+announceBtn.Parent = bottomHolder
+
+local notifyBtn = Instance.new("TextButton")
+notifyBtn.Size = UDim2.new(0, 120, 0, 32)
+notifyBtn.Position = UDim2.new(1, -124, 0, 0)
+notifyBtn.Text = "Notify"
+notifyBtn.Font = Enum.Font.GothamBold
+notifyBtn.TextSize = 14
+notifyBtn.BackgroundColor3 = Color3.fromRGB(160,160,160)
+notifyBtn.Parent = bottomHolder
+
+local announceAllBtn = Instance.new("TextButton")
+announceAllBtn.Size = UDim2.new(0, 120, 0, 32)
+announceAllBtn.Position = UDim2.new(1, 0, 0, 0)
+announceAllBtn.AnchorPoint = Vector2.new(1,0)
+announceAllBtn.Text = "Announce All Servers"
+announceAllBtn.Font = Enum.Font.GothamBold
+announceAllBtn.TextSize = 14
+announceAllBtn.BackgroundColor3 = Color3.fromRGB(120,120,120)
+announceAllBtn.Parent = bottomHolder
+
+-- Right panel: player list with tags (vertical)
+local rightPanel = Instance.new("Frame")
+rightPanel.Name = "Right"
+rightPanel.Size = UDim2.new(0, 220, 1, -20)
+rightPanel.Position = UDim2.new(0, 634, 0, 58)
+rightPanel.BackgroundColor3 = UI.Theme.Panel
+rightPanel.BorderSizePixel = 0
+rightPanel.Parent = root
+
+local rightTitle = Instance.new("TextLabel")
+rightTitle.Size = UDim2.new(1, -12, 0, 28)
+rightTitle.Position = UDim2.new(0, 6, 0, 6)
+rightTitle.BackgroundTransparency = 1
+rightTitle.Text = "Players"
+rightTitle.Font = Enum.Font.GothamBold
+rightTitle.TextSize = 16
+rightTitle.TextColor3 = UI.Theme.Text
+rightTitle.TextXAlignment = Enum.TextXAlignment.Left
+rightTitle.Parent = rightPanel
+
+local playerListFrame = Instance.new("ScrollingFrame")
+playerListFrame.Size = UDim2.new(1, -12, 1, -44)
+playerListFrame.Position = UDim2.new(0, 6, 0, 36)
+playerListFrame.CanvasSize = UDim2.new(0,0,0,0)
+playerListFrame.ScrollBarThickness = 8
+playerListFrame.BackgroundTransparency = 1
+playerListFrame.Parent = rightPanel
+
+local playerLayout = Instance.new("UIListLayout")
+playerLayout.SortOrder = Enum.SortOrder.LayoutOrder
+playerLayout.Padding = UDim.new(0,6)
+playerLayout.Parent = playerListFrame
+
+-- selection state
 local selectedPlayerName = nil
-local function refreshPlayerList()
-    -- clear
-    for _, child in pairs(ui.PlayerList:GetChildren()) do
-        if child:IsA("Frame") then child:Destroy() end
-    end
-    -- list players
-    for i, pl in ipairs(Players:GetPlayers()) do
-        local entry = Instance.new("Frame")
-        entry.Size = UDim2.new(1, 0, 0, 30)
-        entry.BackgroundTransparency = 1
-        entry.Parent = ui.PlayerList
-
-        local nameLabel = Instance.new("TextLabel")
-        nameLabel.Size = UDim2.new(0.6, 0, 1, 0)
-        nameLabel.Position = UDim2.new(0, 6, 0, 0)
-        nameLabel.BackgroundTransparency = 1
-        nameLabel.Text = pl.Name
-        nameLabel.TextColor3 = UI_THEME.text
-        nameLabel.Font = Enum.Font.SourceSans
-        nameLabel.TextSize = 14
-        nameLabel.TextXAlignment = Enum.TextXAlignment.Left
-        nameLabel.Parent = entry
-
-        local selBtn = Instance.new("TextButton")
-        selBtn.Size = UDim2.new(0.35, -12, 0.8, 0)
-        selBtn.Position = UDim2.new(0.62, 0, 0.1, 0)
-        selBtn.BackgroundColor3 = UI_THEME.accent
-        selBtn.Text = "Select"
-        selBtn.Font = Enum.Font.SourceSans
-        selBtn.TextSize = 14
-        selBtn.Parent = entry
-
-        selBtn.MouseButton1Click:Connect(function()
-            selectedPlayerName = pl.Name
-            -- highlight
-            for _, ch in pairs(ui.PlayerList:GetChildren()) do
-                if ch:IsA("Frame") then
-                    for _, sub in pairs(ch:GetChildren()) do
-                        if sub:IsA("TextButton") then sub.BackgroundColor3 = UI_THEME.accent end
-                    end
-                end
+local function highlightSelectedEntry()
+    for _,c in ipairs(playerListFrame:GetChildren()) do
+        if c:IsA("Frame") then
+            local btn = c:FindFirstChild("Select")
+            if btn then btn.BackgroundColor3 = Color3.fromRGB(38,38,38) end
+            local nameLbl = c:FindFirstChild("Name")
+            if nameLbl and nameLbl.Text == selectedPlayerName then
+                local b = c:FindFirstChild("Select")
+                if b then b.BackgroundColor3 = Color3.fromRGB(0,150,130) end
             end
-            selBtn.BackgroundColor3 = Color3.fromRGB(0,200,120)
-        end)
-    end
-
-    -- update canvas size
-    local layout = ui.PlayerList:FindFirstChildOfClass("UIListLayout")
-    if layout then
-        ui.PlayerList.CanvasSize = UDim2.new(0, 0, 0, layout.AbsoluteContentSize.Y + 10)
+        end
     end
 end
 
-Players.PlayerAdded:Connect(refreshPlayerList)
-Players.PlayerRemoving:Connect(refreshPlayerList)
-refreshPlayerList()
+-- make one player entry
+local function makePlayerEntry(pl)
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(1, -6, 0, 30)
+    frame.BackgroundTransparency = 1
+    frame.Parent = playerListFrame
 
--- ===== Action implementations =====
+    local nameLbl = Instance.new("TextLabel")
+    nameLbl.Name = "Name"
+    nameLbl.Position = UDim2.new(0, 6, 0, 0)
+    nameLbl.Size = UDim2.new(0.7, 0, 1, 0)
+    nameLbl.BackgroundTransparency = 1
+    nameLbl.Text = pl.Name .. " [" .. (pl.DisplayName or pl.Name) .. "]"
+    nameLbl.Font = Enum.Font.SourceSans
+    nameLbl.TextSize = 14
+    nameLbl.TextColor3 = UI.Theme.Text
+    nameLbl.TextXAlignment = Enum.TextXAlignment.Left
+    nameLbl.Parent = frame
+
+    local selBtn = Instance.new("TextButton")
+    selBtn.Name = "Select"
+    selBtn.Position = UDim2.new(0.72, 0, 0.12, 0)
+    selBtn.Size = UDim2.new(0.26, -6, 0.76, 0)
+    selBtn.BackgroundColor3 = Color3.fromRGB(38,38,38)
+    selBtn.Text = "Select"
+    selBtn.Font = Enum.Font.SourceSans
+    selBtn.TextSize = 13
+    selBtn.TextColor3 = Color3.new(1,1,1)
+    selBtn.Parent = frame
+
+    selBtn.MouseButton1Click:Connect(function()
+        selectedPlayerName = pl.Name
+        highlightSelectedEntry()
+    end)
+
+    return frame
+end
+
+local function rebuildPlayerList()
+    for _,v in ipairs(playerListFrame:GetChildren()) do
+        if v:IsA("Frame") then v:Destroy() end
+    end
+    for _,pl in ipairs(Players:GetPlayers()) do
+        if pl ~= LocalPlayer then
+            makePlayerEntry(pl)
+        end
+    end
+    playerListFrame.CanvasSize = UDim2.new(0,0,0, playerLayout.AbsoluteContentSize.Y + 12)
+    highlightSelectedEntry()
+end
+
+Players.PlayerAdded:Connect(rebuildPlayerList)
+Players.PlayerRemoving:Connect(rebuildPlayerList)
+rebuildPlayerList()
+
+-- ======= ACTIONS (implementations) =======
 local function getSelectedPlayer()
     if not selectedPlayerName then return nil end
     return Players:FindFirstChild(selectedPlayerName)
 end
 
--- TeleportTo (client attempt) - may fail if server blocks; alternative: set character CFrame
-ui.TeleportBtn.MouseButton1Click:Connect(function()
-    local pl = getSelectedPlayer()
-    if not pl or not pl.Character or not pl.Character:FindFirstChild("HumanoidRootPart") then
-        warn("No selected player or their character invalid")
-        return
+-- client-side teleport-to-player (set CFrame)
+local function teleportToPlayer(target)
+    if not target or not target.Character or not LocalPlayer.Character then return end
+    local tgtHRP = target.Character:FindFirstChild("HumanoidRootPart")
+    local myHRP = LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if tgtHRP and myHRP then
+        pcall(function() myHRP.CFrame = tgtHRP.CFrame + Vector3.new(2,0,0) end)
     end
-    local hrp = pl.Character.HumanoidRootPart
-    local myChar = LocalPlayer.Character
-    if myChar and myChar:FindFirstChild("HumanoidRootPart") then
-        LocalPlayer.Character.HumanoidRootPart.CFrame = hrp.CFrame + Vector3.new(2,0,0)
-        print("Teleported to", pl.Name)
+end
+
+-- Bring player (try to set their HRP CFrame) - may fail due to server restrictions
+local function bringPlayer(target)
+    if not target or not target.Character or not LocalPlayer.Character then return end
+    local myHRP = LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if not myHRP then return end
+    local tgtHRP = target.Character:FindFirstChild("HumanoidRootPart")
+    if tgtHRP then
+        local ok, err = pcall(function()
+            tgtHRP.CFrame = myHRP.CFrame + Vector3.new(2,0,0)
+        end)
+        if not ok then warn("Bring failed (server protections?)", err) end
     end
-end)
+end
 
--- Bring: move target to your position (attempt via changing their HRP CFrame -- may be blocked server-side)
-ui.BringBtn.MouseButton1Click:Connect(function()
-    local pl = getSelectedPlayer()
-    if not pl or not pl.Character or not pl.Character:FindFirstChild("HumanoidRootPart") then
-        warn("No selected player or their character invalid")
-        return
+-- Clear inventory (client attempt: remove Tools in Backpack + Character)
+local function clearInventory(target)
+    if not target then return end
+    local function clearContainer(container)
+        for _, item in pairs(container:GetChildren()) do
+            if item:IsA("Tool") or item:IsA("Accessory") then
+                pcall(function() item:Destroy() end)
+            end
+        end
     end
-    local myHr = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
-    if not myHr then return end
-    local success, err = pcall(function()
-        pl.Character.HumanoidRootPart.CFrame = myHr.CFrame + Vector3.new(2,0,0)
-    end)
-    if not success then warn("Bring failed:", err) end
-end)
+    clearContainer(target.Backpack or Instance.new("Folder"))
+    if target.Character then clearContainer(target.Character) end
+end
 
--- Copy name
-ui.CopyBtn.MouseButton1Click:Connect(function()
-    local pl = getSelectedPlayer()
-    if not pl then return end
-    setclipboard and pcall(setclipboard, pl.Name)
-    print("Copied name:", pl.Name)
-end)
-
--- Respawn
-ui.RespawnBtn.MouseButton1Click:Connect(function()
-    if LocalPlayer.Character then
-        LocalPlayer.Character:BreakJoints()
+-- Kick (try server remote first, fallback to client (can't kick others client-side normally))
+local function kickPlayer(target)
+    if not target then return end
+    local remotePath = SERVER_REMOTES.Kick
+    if remotePath then
+        local fired = safeFire(remotePath, target.UserId)
+        if fired then return end
     end
-end)
+    -- fallback: teleport target to an invalid place (only works if you have control)
+    warn("Kick requires server remote; no server remote found or failed.")
+end
 
--- Speed/Jump apply
-local function applySpeedJump()
-    local s = tonumber(ui.SpeedBox.Text) or 16
-    local j = tonumber(ui.JumpBox.Text) or 50
-    ui.SpeedLabel.Text = "WalkSpeed: "..tostring(s)
-    ui.JumpLabel.Text = "JumpPower: "..tostring(j)
+-- Ban / Unban placeholders
+local function banPlayer(target)
+    if not target then return end
+    if SERVER_REMOTES.Ban then
+        local ok = safeFire(SERVER_REMOTES.Ban, target.UserId)
+        if not ok then warn("Ban remote failed or missing.") end
+    else
+        warn("Ban remote not configured. Add path to SERVER_REMOTES.Ban")
+    end
+end
+local function unbanPlayer(nameOrId)
+    if SERVER_REMOTES.Unban then
+        safeFire(SERVER_REMOTES.Unban, nameOrId)
+    else
+        warn("Unban remote not configured.")
+    end
+end
+
+-- Give placeholder (server-side)
+local function giveItem(target, itemName)
+    if not target then return end
+    if SERVER_REMOTES.Give then
+        safeFire(SERVER_REMOTES.Give, target.UserId, itemName)
+    else
+        warn("Give remote not configured.")
+    end
+end
+
+-- Toggle fly (simple client fly for local player)
+local flyOn = false
+local flyBV
+local function toggleFlyLocal()
     local char = LocalPlayer.Character
-    if char and char:FindFirstChildOfClass("Humanoid") then
-        local hum = char:FindFirstChildOfClass("Humanoid")
-        hum.WalkSpeed = s
-        hum.JumpPower = j
+    if not char then return end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+    flyOn = not flyOn
+    if flyOn then
+        flyBV = Instance.new("BodyVelocity")
+        flyBV.MaxForce = Vector3.new(1e5,1e5,1e5)
+        flyBV.Velocity = Vector3.new(0,0,0)
+        flyBV.Parent = hrp
+        warn("Fly enabled (local). Use WASD to move.")
+    else
+        if flyBV then flyBV:Destroy() flyBV = nil end
     end
 end
-ui.SpeedBox.FocusLost:Connect(applySpeedJump)
-ui.JumpBox.FocusLost:Connect(applySpeedJump)
 
--- Noclip
-local noclipEnabled = false
-local noclipConn
-ui.NoclipBtn.MouseButton1Click:Connect(function()
-    noclipEnabled = not noclipEnabled
-    ui.NoclipBtn.Text = "Toggle Noclip ("..(noclipEnabled and "On" or "Off")..")"
-    if noclipEnabled then
-        noclipConn = RunService.Stepped:Connect(function()
-            local char = LocalPlayer.Character
-            if char then
-                for _, part in pairs(char:GetDescendants()) do
-                    if part:IsA("BasePart") then
-                        part.CanCollide = false
-                    end
-                end
-            end
-        end)
+-- Announce (server-side)
+local function announce(text)
+    if SERVER_REMOTES.Announce then
+        safeFire(SERVER_REMOTES.Announce, text)
     else
-        if noclipConn then noclipConn:Disconnect(); noclipConn = nil end
-        -- restore
-        local char = LocalPlayer.Character
-        if char then
-            for _, part in pairs(char:GetDescendants()) do
-                if part:IsA("BasePart") then
-                    part.CanCollide = true
-                end
-            end
-        end
+        StarterGui:SetCore("ChatMakeSystemMessage", {
+            Text = "[Admin Announce] " .. tostring(text);
+            Color = Color3.fromRGB(200,200,60);
+            Font = Enum.Font.SourceSansBold;
+            FontSize = Enum.FontSize.Size24;
+        })
     end
-end)
-
--- Infinite jump
-local infJump = false
-ui.InfJumpBtn.MouseButton1Click:Connect(function()
-    infJump = not infJump
-    ui.InfJumpBtn.Text = "Toggle Infinite Jump ("..(infJump and "On" or "Off")..")"
-end)
-LocalPlayer.CharacterAdded:Connect(function()
-    wait(0.5)
-    applySpeedJump()
-end)
-UserInputService.JumpRequest:Connect(function()
-    if infJump then
-        local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
-        if hum then
-            hum:ChangeState(Enum.HumanoidStateType.Jumping)
-        end
-    end
-end)
-
--- Simple Fly (press E to toggle when enabled)
-local flying = false
-local flyVel
-ui.FlyBtn.MouseButton1Click:Connect(function()
-    flying = not flying
-    ui.FlyBtn.Text = "Toggle Fly ("..(flying and "On" or "Off")..")"
-    if flying then
-        local char = LocalPlayer.Character
-        if not char then return end
-        local hrp = char:FindFirstChild("HumanoidRootPart")
-        if not hrp then return end
-        hrp.PlatformStand = true
-        flyVel = Instance.new("BodyVelocity")
-        flyVel.MaxForce = Vector3.new(1e5,1e5,1e5)
-        flyVel.Velocity = Vector3.new(0,0,0)
-        flyVel.Parent = hrp
-        -- control with WASD
-        local forward, back, left, right = false,false,false,false
-        local conn
-        conn = RunService.RenderStepped:Connect(function()
-            if not flying or not hrp.Parent then
-                conn:Disconnect()
-                if flyVel then flyVel:Destroy() end
-                if hrp then hrp.PlatformStand = false end
-                return
-            end
-            local move = Vector3.new(0,0,0)
-            if forward then move = move + hrp.CFrame.LookVector end
-            if back then move = move - hrp.CFrame.LookVector end
-            if left then move = move - hrp.CFrame.RightVector end
-            if right then move = move + hrp.CFrame.RightVector end
-            flyVel.Velocity = move * 50
-        end)
-        UserInputService.InputBegan:Connect(function(input, gpe)
-            if gpe then return end
-            if input.KeyCode == Enum.KeyCode.W then forward = true end
-            if input.KeyCode == Enum.KeyCode.S then back = true end
-            if input.KeyCode == Enum.KeyCode.A then left = true end
-            if input.KeyCode == Enum.KeyCode.D then right = true end
-            if input.KeyCode == Enum.KeyCode.E then -- toggle off with E
-                flying = false
-                ui.FlyBtn.Text = "Toggle Fly (Off)"
-            end
-        end)
-        UserInputService.InputEnded:Connect(function(input, gpe)
-            if input.KeyCode == Enum.KeyCode.W then forward = false end
-            if input.KeyCode == Enum.KeyCode.S then back = false end
-            if input.KeyCode == Enum.KeyCode.A then left = false end
-            if input.KeyCode == Enum.KeyCode.D then right = false end
-        end)
-    else
-        local char = LocalPlayer.Character
-        if char and char:FindFirstChild("HumanoidRootPart") then
-            local hrp = char.HumanoidRootPart
-            hrp.PlatformStand = false
-            if flyVel then flyVel:Destroy() flyVel = nil end
-        end
-    end
-end)
-
--- Remote fire/invoke (manual)
-ui.FireBtn.MouseButton1Click:Connect(function()
-    local txt = ui.RemoteBox.Text
-    if not txt or txt == "" then return end
-    local ok, remote = pcall(function()
-        -- allow "Folder.RemoteName" format
-        local pathParts = {}
-        for part in string.gmatch(txt, "([^%.]+)") do table.insert(pathParts, part) end
-        local obj = game
-        for _, p in ipairs(pathParts) do
-            obj = obj:FindFirstChild(p)
-            if not obj then break end
-        end
-        return obj
-    end)
-    if not ok or not remote then
-        warn("Remote not found")
-        return
-    end
-    if remote.FireServer then
-        pcall(function() remote:FireServer() end)
-        print("Fired remote:", txt)
-    else
-        warn("Object has no FireServer")
-    end
-end)
-
-ui.InvokeBtn.MouseButton1Click:Connect(function()
-    local txt = ui.RemoteBox.Text
-    if not txt or txt == "" then return end
-    local ok, remote = pcall(function()
-        local pathParts = {}
-        for part in string.gmatch(txt, "([^%.]+)") do table.insert(pathParts, part) end
-        local obj = game
-        for _, p in ipairs(pathParts) do
-            obj = obj:FindFirstChild(p)
-            if not obj then break end
-        end
-        return obj
-    end)
-    if not ok or not remote then
-        warn("Remote not found")
-        return
-    end
-    if remote.InvokeServer then
-        local suc, res = pcall(function() return remote:InvokeServer() end)
-        if suc then print("InvokeServer result:", res) else warn("Invoke failed:", res) end
-    else
-        warn("Object has no InvokeServer")
-    end
-end)
-
--- ===== Auto-join (simpler version) =====
-local autoJoinActive = false
-local autoJoinThread
-local function startAutoJoin(targetName)
-    if autoJoinActive then return end
-    autoJoinActive = true
-    autoJoinThread = coroutine.create(function()
-        print("[AutoJoin] searching for", targetName)
-        local cursor = nil
-        while autoJoinActive do
-            local url = ("https://games.roblox.com/v1/games/%d/servers/Public?limit=100"):format(TARGET_PLACE_ID)
-            if cursor then url = url .. "&cursor=" .. cursor end
-            local res = try_call_http({Url = url, Method = "GET"})
-            if not res or res.StatusCode ~= 200 then
-                warn("[AutoJoin] http failed or rate-limited")
-                wait(AUTOJOIN_POLL)
-            else
-                local ok, data = pcall(function() return game:GetService("HttpService"):JSONDecode(res.Body) end)
-                if not ok then
-                    warn("json decode failed")
-                    wait(AUTOJOIN_POLL)
-                else
-                    local servers = data.data or {}
-                    for _, server in ipairs(servers) do
-                        -- check players field if present
-                        if server.playing and server.maxPlayers then
-                            -- can't check names usually; skip
-                        end
-                        if server.playerUsernames then
-                            for _, name in ipairs(server.playerUsernames) do
-                                if name:lower() == targetName:lower() then
-                                    local jobId = server.id or server.playSessionId or server.jobId
-                                    if jobId then
-                                        print("Found server with target, teleporting...")
-                                        pcall(function()
-                                            TeleportService:TeleportToPlaceInstance(TARGET_PLACE_ID, jobId, LocalPlayer)
-                                        end)
-                                        autoJoinActive = false
-                                        return
-                                    end
-                                end
-                            end
-                        end
-                    end
-                    cursor = data.nextPageCursor
-                    if not cursor then
-                        -- finished pages, pause then retry
-                        wait(AUTOJOIN_POLL)
-                    end
-                end
-            end
-        end
-    end)
-    coroutine.resume(autoJoinThread)
 end
 
--- Example: startAutoJoin("TargetPlayerName")
--- For safety, not wired to UI by default. You can call startAutoJoin("name") in executor.
+-- TP Location: will teleport selected player to a typed CFrame (simple prompt)
+local function tpLocationToSelected(x,y,z)
+    local pl = getSelectedPlayer()
+    if not pl or not pl.Character then return end
+    local hrp = pl.Character:FindFirstChild("HumanoidRootPart")
+    if hrp then
+        pcall(function() hrp.CFrame = CFrame.new(x,y,z) end)
+    end
+end
 
--- ===== Quick on-load apply speed/jump =====
-applySpeedJump()
+-- Hard Wipe (attempt to clear everything from player's character/backpack)
+local function hardWipe(target)
+    clearInventory(target)
+    if target.Character then
+        for _,v in pairs(target.Character:GetChildren()) do
+            if v:IsA("BasePart") or v:IsA("Accessory") or v:IsA("Tool") then
+                pcall(function() v:Destroy() end)
+            end
+        end
+    end
+end
 
--- ===== small helper: show note to user in output =====
-print("[FischAdminMenu] Loaded. Select a player then use buttons. To auto-join call startAutoJoin(\"Name\") from executor console if you want.")
+-- Freeze / Unfreeze: set Anchored on HumanoidRootPart (dangerous)
+local frozenPlayers = {}
+local function toggleFreeze(target)
+    if not target or not target.Character then return end
+    local hrp = target.Character:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+    local key = target.UserId
+    if frozenPlayers[key] then
+        pcall(function() hrp.Anchored = false end)
+        frozenPlayers[key] = nil
+    else
+        pcall(function() hrp.Anchored = true end)
+        frozenPlayers[key] = true
+    end
+end
 
--- End of script
+-- ======= WIRE UP BUTTONS =======
+btnBan.MouseButton1Click:Connect(function()
+    local pl = getSelectedPlayer()
+    if not pl then warn("Select a player first") return end
+    banPlayer(pl)
+end)
+btnUnban.MouseButton1Click:Connect(function()
+    local pl = getSelectedPlayer()
+    if pl then unbanPlayer(pl.Name) else warn("Provide name to unban manually via console: unbanPlayer('name')") end
+end)
+btnKick.MouseButton1Click:Connect(function()
+    local pl = getSelectedPlayer()
+    if not pl then warn("Select a player first") return end
+    kickPlayer(pl)
+end)
+
+btnTo.MouseButton1Click:Connect(function()
+    local pl = getSelectedPlayer()
+    teleportToPlayer(pl)
+end)
+btnBring.MouseButton1Click:Connect(function()
+    local pl = getSelectedPlayer()
+    bringPlayer(pl)
+end)
+btnTPLoc.MouseButton1Click:Connect(function()
+    -- simple prompt using InputDialog (not available everywhere) -> use prompt in executor console
+    warn("TP Location: call tpLocationToSelected(x,y,z) from executor with coordinates.")
+end)
+
+btnSetValue.MouseButton1Click:Connect(function()
+    warn("Set Value: This is server-specific. Call server remote or implement logic.")
+end)
+btnGive.MouseButton1Click:Connect(function()
+    local pl = getSelectedPlayer()
+    if not pl then warn("Select a player to give an item to.") return end
+    local item = "ExampleItem"
+    giveItem(pl, item)
+end)
+btnClearInv.MouseButton1Click:Connect(function()
+    local pl = getSelectedPlayer()
+    if not pl then warn("Select target") return end
+    clearInventory(pl)
+end)
+
+btnHardWipe.MouseButton1Click:Connect(function()
+    local pl = getSelectedPlayer()
+    if not pl then warn("Select a player") return end
+    hardWipe(pl)
+end)
+btnUnFreeze.MouseButton1Click:Connect(function()
+    local pl = getSelectedPlayer()
+    if not pl then warn("Select a player") return end
+    toggleFreeze(pl)
+end)
+btnToggleFly.MouseButton1Click:Connect(function()
+    toggleFlyLocal()
+end)
+
+announceBtn.MouseButton1Click:Connect(function()
+    local text = announceBox.Text
+    if not text or text == "" then warn("Enter announcement text") return end
+    announce(text)
+end)
+notifyBtn.MouseButton1Click:Connect(function()
+    local t = announceBox.Text
+    if not t or t == "" then t = "Notification from admin" end
+    StarterGui:SetCore("SendNotification", {Title = "Admin", Text = t, Duration = 5})
+end)
+announceAllBtn.MouseButton1Click:Connect(function()
+    local t = announceBox.Text
+    if not t or t == "" then warn("Enter text") return end
+    warn("Announce All Servers: requires server-side support. Call server remote if set.")
+    if SERVER_REMOTES.Announce then
+        safeFire(SERVER_REMOTES.Announce, t, true) -- hypothetical param "all servers"
+    end
+end)
+
+-- ======= Dragging (make the whole root draggable like admin menu) =======
+local dragging, dragStart, startPos = false, nil, nil
+root.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragging = true
+        dragStart = input.Position
+        startPos = root.Position
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                dragging = false
+            end
+        end)
+    end
+end)
+root.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement and dragging then
+        local delta = input.Position - dragStart
+        root.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+    end
+end)
+
+-- ======= Final notes (console helpers) =======
+print("[FischAdminMenu] Loaded. Select player on the right then use center actions.")
+print("Console helpers: banPlayer(player), unbanPlayer(name), kickPlayer(player), giveItem(player, itemName), tpLocationToSelected(x,y,z)")
+
+-- expose helpers to global for executor convenience
+_G.adminHelpers = {
+    banPlayer = banPlayer,
+    unbanPlayer = unbanPlayer,
+    kickPlayer = kickPlayer,
+    giveItem = giveItem,
+    tpLocationToSelected = tpLocationToSelected,
+    hardWipe = hardWipe,
+    toggleFreeze = toggleFreeze,
+    announce = announce
+}
